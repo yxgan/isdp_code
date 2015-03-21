@@ -4,7 +4,7 @@
 Sonar sensor
  
  Testing the use of mini OLED display + ultrasonic sensor
- v6.1 add one long distance ir
+ v6.1 add one long distance ir 2
  v6.0 added servo.h
  v5.1 delete 2 motor
        3 sonar sensor
