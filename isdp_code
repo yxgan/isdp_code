@@ -1,0 +1,569 @@
+
+
+/*********************************************************************
+Sonar sensor
+ 
+ Testing the use of mini OLED display + ultrasonic sensor
+ v6.1 add one long distance ir
+ v6.0 added servo.h
+ v5.1 delete 2 motor
+       3 sonar sensor
+v5.0 added position estimation functioin
+v4.0- aaded encoder
+v3.0- 2 sonar sensor
+v2.0- one sensor with testing pulse
+
+ ---------------------------------------------------------------------- 
+ Library for a 128x64 size display using I2C is 
+ written by Limor Fried/Ladyada  for Adafruit Industries.  
+ BSD license, check license.txt for more information
+ 
+ Codes for HC-SR04 originates from here: 
+ http://arduinobasics.blogspot.com.au/2012/11/arduinobasics-hc-sr04-ultrasonic-sensor.html
+ 
+ Codes for interrupt originates from here:
+ http://www.instructables.com/id/Arduino-Timer-Interrupts/
+
+ *********************************************************************/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <Encoder.h>
+#include <Servo.h> 
+#include "TimerOne.h"
+#include "TimerThree.h"
+#include "TimerFour.h"
+//Define motor pin number
+#define MOTOR_LEFT_PULSE 12
+#define MOTOR_RIGHT_PULSE 11
+#define MOTOR_LEFT_DIRECTION 13
+#define MOTOR_RIGHT_DIRECTION 10
+
+//Define encoder pin number
+#define ENCODER_FRONT_A 18 // --> interrupt #5
+#define ENCODER_FRONT_B 22
+#define ENCODER_BACK_A 19  // --> interrupt #4
+#define ENCODER_BACK_B 23
+
+//======================================================================
+// HC-SR04 Ping distance sensor:
+#define USONIC_CENTER_ECHO 2 // Echo Pin     --> interrupt #1 (brown )
+#define USONIC_CENTER_TRIG 5// Trigger Pin  <-- Timer 1  (white )
+#define USONIC_LEFT_ECHO 3 // Echo Pin     --> interrupt #0
+#define USONIC_LEFT_TRIG 4 // Trigger Pin  <-- Timer 1
+#define USONIC_RIGHT_ECHO 21 // Echo Pin     --> interrupt #2
+#define USONIC_RIGHT_TRIG 20 // Trigger Pin  <-- Timer 1
+//======================================================================
+// Ir Line Sensor
+#define IR_SENSOR_LEFT 51 //   brown colour 
+#define IR_SENSOR_RIGHT 30 // 
+
+// Motor servo
+#define SERVO_MOTOR_LIFT 8 //    
+#define SERVO_MOTOR_GRIPPER 9 // 
+
+#define sensorIR 15               //Must be an analog pin
+/***********/
+/* Defines postion function 
+TICK_PER_MM and DIAMETER
+TICK_PER_MM is the number of ticks that your encoder does to do 1millimeter on the ground)
+**********/
+
+#define TICK_PER_MM_LEFT  2.438118
+#define TICK_PER_MM_RIGHT  2.438118
+#define DIAMETER  240.0 // Distance between the 2 wheels (in millimeter)
+
+#define TWOPI 6.2831853070
+#define RAD2DEG 57.2958 /* radians to degrees conversion */
+
+/********************/
+/* Global variables */
+/********************/
+volatile long newLeft = 0;
+volatile long newRight = 0;
+
+double pos_X = 0;
+double pos_Y = 0;
+double theta = 0;
+
+int last_left = 0;
+int last_right = 0;
+
+int left_diff = 0;
+int right_diff = 0;
+
+double total_distance = 0.0;
+
+
+int maximumRange = 200;  // Maximum range needed
+int minimumRange = 0;    // Minimum range needed
+volatile unsigned long center_start_time, center_duration, center_distance; // center_duration used to calculate distance
+volatile unsigned long right_start_time, right_duration, right_distance; // left_duration used to calculate distance
+volatile unsigned long left_start_time, left_duration, left_distance; // right_duration used to calculate distance
+volatile boolean pulse_started_center = false;
+volatile boolean pulse_started_left = false;
+volatile boolean pulse_started_right = false;
+
+// Constants and variables for the state machine
+enum state_type { 
+                  Idle, 
+                  Forward, 
+                  Backward,
+                  Stop,
+                  Left,
+                  Left45,
+                  Right45,
+                  Gripper_down,
+                  Gripper_up,
+                  AvoidObstacle 
+                };
+state_type state = Idle;
+
+//======================================================================
+
+// Change these pin numbers to the pins connected to your encoder.
+//   Best Performance: both pins have interrupt capability
+//   Good Performance: only the first pin has interrupt capability
+//   Low Performance:  neither pin has interrupt capability
+Encoder knobLeft(ENCODER_FRONT_A, ENCODER_FRONT_B);
+Encoder knobRight(ENCODER_BACK_A, ENCODER_BACK_B);
+long positionLeft  = -999;
+long positionRight = -999;
+// servo
+Servo lift_servo;  // create servo object to control a servo 
+Servo gripper_servo;
+//   *******************************
+float sensorValue, inches, cm;    //Must be of type float for pow()
+void setup()   
+{                
+  Serial.begin(9600);
+  pinMode(MOTOR_LEFT_PULSE, OUTPUT);
+  pinMode(MOTOR_RIGHT_PULSE, OUTPUT);
+  pinMode(MOTOR_LEFT_DIRECTION, OUTPUT);
+  pinMode(MOTOR_RIGHT_DIRECTION, OUTPUT);
+  pinMode(USONIC_CENTER_TRIG, OUTPUT);
+  pinMode(USONIC_CENTER_ECHO, INPUT);
+  pinMode(USONIC_LEFT_TRIG, OUTPUT);
+  pinMode(USONIC_LEFT_ECHO, INPUT);
+  pinMode(USONIC_RIGHT_TRIG, OUTPUT);
+  pinMode(USONIC_RIGHT_ECHO, INPUT);
+  pinMode(IR_SENSOR_LEFT, INPUT);
+  pinMode(IR_SENSOR_RIGHT, INPUT);
+  pinMode(ENCODER_FRONT_A, INPUT);
+  pinMode(ENCODER_FRONT_B, INPUT);
+  pinMode(ENCODER_BACK_A, INPUT);
+  pinMode(ENCODER_BACK_B, INPUT);
+  pinMode(SERVO_MOTOR_LIFT, OUTPUT);
+  pinMode(SERVO_MOTOR_GRIPPER, OUTPUT);
+  //pinMode(LEDPin, OUTPUT); // Use LED indicator (if required)
+
+  // Interrupt settings *****************
+
+  cli();         // stop interrupts
+                 // set timer1 interrupt
+  TCCR1A = 0;    // set entire TCCR1A register to 0
+  TCCR1B = 0;    // same for TCCR1B
+  TCNT1  = 0;    // initialize counter value to 0
+                 // set compare match register for 10hz increments
+  OCR1A = 1561;  // = (16*10^6) / (10*1024) - 1 (must be <65536)
+  //OCR1A = 15624;
+                 // turn on CTC mode
+  TCCR1B |= (1 << WGM12);
+                 // Set CS12 and CS10 bits for 1024 prescaler
+  TCCR1B |= (1 << CS12) | (1 << CS10);  
+                 // enable timer compare interrupt
+  TIMSK1 |= (1 << OCIE1A);
+  
+  sei();         //allow interrupts
+  
+  attachInterrupt(0, isr_get_center_distance, CHANGE);
+  attachInterrupt(1, isr_get_left_distance, CHANGE);
+  attachInterrupt(2, isr_get_right_distance, CHANGE);
+   //attachInterrupt(5, isr_change_state, FALLING);
+  Timer3.initialize(500000);         // initialize timer1, and set a 1/2 second period
+  Timer3.setPeriod(1200);  //speed
+  Timer3.attachInterrupt(callback);  // attaches callback() as a timer overflow interrupt
+  Timer4.initialize(500000);         // initialize timer1, and set a 1/2 second period
+  Timer4.setPeriod(15);  //speed
+  Timer4.attachInterrupt(callback4);  // attaches callback() as a timer overflow interrupt
+  //serbo
+  lift_servo.attach(SERVO_MOTOR_LIFT);  // create servo object to control a servo 
+  gripper_servo.attach(SERVO_MOTOR_GRIPPER);
+  
+}
+void callback()
+{
+    switch( state ) {
+    case Idle: 
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+              break;
+    case Forward:
+              digitalWrite(MOTOR_LEFT_PULSE, digitalRead(MOTOR_LEFT_PULSE) ^ 1);
+              digitalWrite(MOTOR_RIGHT_PULSE, digitalRead(MOTOR_RIGHT_PULSE) ^ 1);
+              break;
+      case Backward:
+              digitalWrite(MOTOR_LEFT_PULSE, digitalRead(MOTOR_LEFT_PULSE) ^ 1);
+              digitalWrite(MOTOR_RIGHT_PULSE, digitalRead(MOTOR_RIGHT_PULSE) ^ 1);
+              break;
+       case Stop: 
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+              break;
+      case Left:
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, digitalRead(MOTOR_RIGHT_PULSE) ^ 1);
+              break;
+       case Left45:
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, digitalRead(MOTOR_RIGHT_PULSE) ^ 1);
+              break;
+        case Right45:
+              digitalWrite(MOTOR_LEFT_PULSE, digitalRead(MOTOR_LEFT_PULSE) ^ 1);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+              break;
+        case Gripper_up:
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+        case Gripper_down:
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+              
+         case AvoidObstacle:
+              digitalWrite(MOTOR_LEFT_PULSE, LOW);
+              digitalWrite(MOTOR_RIGHT_PULSE, LOW);
+              break;
+    default: state=Idle;
+    
+  }
+}
+void callback4()
+{
+  //get_Odometers();
+  Servo::refresh();
+}
+//======================================================================
+// Interrupt service routine for timer1 interrupt
+ISR(TIMER1_COMPA_vect)    
+{
+   // The following USONIC_CENTER_TRIG/USONIC_CENTER_ECHO cycle is used to determine the
+   // distance of the nearest object by bouncing soundwaves off of it.
+   digitalWrite(USONIC_CENTER_TRIG, LOW); 
+   delayMicroseconds(2); 
+   digitalWrite(USONIC_CENTER_TRIG, HIGH);
+   delayMicroseconds(10); 
+   digitalWrite(USONIC_CENTER_TRIG, LOW);
+   pulse_started_center = false;
+   delayMicroseconds(20); 
+   digitalWrite(USONIC_LEFT_TRIG, LOW); 
+   delayMicroseconds(2); 
+   digitalWrite(USONIC_LEFT_TRIG, HIGH);
+   delayMicroseconds(10); 
+   digitalWrite(USONIC_LEFT_TRIG, LOW);
+   pulse_started_left = false;
+     delayMicroseconds(20); 
+   digitalWrite(USONIC_RIGHT_TRIG, LOW); 
+   delayMicroseconds(2); 
+   digitalWrite(USONIC_RIGHT_TRIG, HIGH);
+   delayMicroseconds(10); 
+   digitalWrite(USONIC_RIGHT_TRIG, LOW);
+   pulse_started_right = false;
+   
+   //center_duration = pulseIn(USONIC_CENTER_ECHO, HIGH); 
+   //display.setCursor(0,0);
+   // handle pin change here
+  interrupts ();  // allow more interrupts 
+}
+//ISR(TIMER2_COMPA_vect){  //change the 0 to 1 for timer1 and 2 for timer2
+   //get_Odometers();
+//}
+//======================================================================
+
+void isr_get_center_distance()
+{
+  if( pulse_started_center ) {
+       //display.println( micros() );
+       center_duration = micros() - center_start_time;
+       //distance = center_duration/1000;    //58.2;
+       //pulse_started_center = false;
+   }
+   else {
+       center_start_time = micros();
+
+       pulse_started_center = true;
+   }
+}
+//======================================================================
+
+void isr_get_left_distance()
+{
+  if( pulse_started_left ) {
+       //display.println( micros() );
+       left_duration = micros() - left_start_time;
+       //distance = center_duration/1000;    //58.2;
+       //pulse_started_center = false;
+   }
+   else {
+       left_start_time = micros();
+
+       pulse_started_left = true;
+   }
+}
+//======================================================================
+
+void isr_get_right_distance()
+{
+  if( pulse_started_right ) {
+       //display.println( micros() );
+       right_duration = micros() - right_start_time;
+       //distance = center_duration/1000;    //58.2;
+       //pulse_started_center = false;
+   }
+   else {
+       right_start_time = micros();
+
+       pulse_started_right = true;
+   }
+}
+
+//======================================================================
+// Main loop
+//======================================================================
+bool ir_sensor_left;
+bool ir_sensor_right;
+int left_counter;
+int right_counter;
+int gripper_up_counter;
+int gripper_down_counter;
+int left_right;
+//long newLeft, newRight;
+void loop() 
+{ 
+  calculate_distance();
+   //Serial.print("Left = ");
+  // get_Odometers();
+  ir_sensor_left=digitalRead(IR_SENSOR_LEFT);
+  ir_sensor_right=digitalRead(IR_SENSOR_RIGHT);
+  serial_display();
+  read_long_distance_ir()
+  newLeft = knobLeft.read();  //990 one round
+  newRight = knobRight.read();
+  state=Gripper_down;
+   //Servo::refresh();
+   Serial.print("State = ");
+    Serial.print(state);
+  if (newLeft != positionLeft || newRight != positionRight) {
+    Serial.print("Left = ");
+    Serial.print(newLeft);
+    Serial.print(", Right = ");
+    Serial.print(newRight);
+    Serial.println();
+    positionLeft = newLeft;
+    positionRight = newRight;
+  }
+    if (Serial.available()) {
+    Serial.read();
+    Serial.println("Reset both knobs to zero");
+    knobLeft.write(0);
+    knobRight.write(0);
+  }
+  switch( state ) {
+    case Idle: 
+             digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, HIGH);
+             delay(1000);
+             if( center_distance > 15)  //ultrasonic sensor threshold
+                  state = Forward;
+              break;
+    case Forward:
+             // go_forward();
+             digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, HIGH);
+             //delay(450);
+              if( center_distance < 15 ||left_distance < 23||right_distance < 23)
+                  state = Backward;
+             // else if (ir_sensor_left==0)
+                 //state = Backward;
+              else{
+                 state = Forward;
+                 left_counter=0;
+              }
+              break;
+       case Backward:
+             digitalWrite(MOTOR_LEFT_DIRECTION, HIGH);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, LOW);
+             delay(1000);
+             state=Stop;
+              break;
+        case Stop:
+             digitalWrite(MOTOR_LEFT_DIRECTION, HIGH);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, LOW);
+             delay(1000);
+              Serial.print("left_right");
+              Serial.println(left_right);
+              if(left_right==5){
+              left_right=0;
+               }
+             if (left_right<2)
+               {
+                 left_counter=0;
+                 state=Left45;
+                 left_right=left_right+1;
+               }
+                      
+              else{
+               right_counter=0;
+                 state=Right45;
+                 left_right=left_right+1;
+              }
+              break;
+        case Left:
+             digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, HIGH);
+             delay(1000);
+             state=Idle;
+              break;
+         case Left45:
+         
+             digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, HIGH);
+             left_counter=left_counter+1;
+             Serial.println(left_counter);
+              if( center_distance < 15 ||left_distance < 23||right_distance < 23)
+                  state = Backward;
+             else if( left_counter > 60 )
+                  state = Idle;
+              else{
+                  state = Left45;
+                  right_counter=0;
+              }
+              break;
+           case Right45:
+           digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, HIGH);
+             right_counter=right_counter+1;
+               if( center_distance < 15 ||left_distance < 23||right_distance < 23)
+                  state = Backward;
+             else  if( right_counter > 60 )
+                  state = Idle;
+              else
+                  state = Right45;
+              break;
+              
+           case Gripper_up:
+             digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+             digitalWrite(MOTOR_RIGHT_DIRECTION, LOW);
+             lift_servo.write(100);
+             gripper_servo.write(50);
+               gripper_up_counter=gripper_up_counter+1;
+                 if( gripper_up_counter > 60 )
+                    state = Idle;
+                else
+                    state = Gripper_up;
+                break;
+            case Gripper_down:
+               digitalWrite(MOTOR_LEFT_DIRECTION, LOW);
+               digitalWrite(MOTOR_RIGHT_DIRECTION, LOW);
+               lift_servo.write(65);
+               gripper_servo.write(170);
+                 gripper_down_counter=gripper_down_counter+1;
+                   if( gripper_down_counter > 60 )
+                      state = Idle;
+                  else
+                      state = Gripper_down;
+                  break;
+    case AvoidObstacle:
+              state = Backward;
+              break;
+     default: state=Idle;
+  }
+  
+}
+
+
+
+//======================================================================
+//FOr Display
+//======================================================================
+void serial_display()
+{
+  Serial.print("center_distance");
+  Serial.println(center_distance);
+  Serial.print("left_distance");
+  Serial.println(left_distance);
+  Serial.print("right_distance");
+  Serial.println(right_distance);
+  /*Serial.print("IR_SENSOR_LEFT");
+  Serial.println(ir_sensor_left);
+  Serial.print("IR_SENSOR_RIGHT");
+  Serial.println(ir_sensor_right);*/
+}
+void calculate_distance()
+{
+  
+  center_distance = center_duration/58.2;
+  left_distance = left_duration/58.2;
+   right_distance = right_duration/58.2;
+}
+/********************************/
+/* Read Long Distance sensor */
+/********************************/
+void read_long_distance_ir() {
+  sensorValue = analogRead(sensorIR);
+  inches = 4192.936 * pow(sensorValue,-0.935) - 3.937;
+  cm = 10650.08 * pow(sensorValue,-0.935) - 10;
+  delay(100);
+  Serial.print("Cm: ");
+  Serial.println(cm);
+}
+
+/********************************/
+/* POSITION ESTIMATION FUNCTION */
+/********************************/
+
+/* Compute the position of the robot */
+void get_Odometers(void)
+{
+  long left_wheel = 0;
+  long right_wheel = 0;
+  
+  double left_mm = 0.0;
+  double right_mm = 0.0;
+  
+  double distance = 0.0;
+  
+  
+  left_wheel = newLeft;
+  right_wheel = newRight;
+  
+  left_diff = last_left - left_wheel;
+  right_diff = last_right - right_wheel;
+  
+  last_left = left_wheel;
+  last_right = right_wheel;
+  
+  left_mm = ((double) left_diff) / TICK_PER_MM_LEFT;
+  right_mm = ((double) right_diff) / TICK_PER_MM_RIGHT;
+  
+  distance = (left_mm + right_mm) / 2;
+  total_distance += distance;
+  
+  theta += (right_mm - left_mm) / DIAMETER;
+  
+  if (theta > PI)
+  theta -= TWOPI;
+  if (theta < (-PI))
+  theta += TWOPI;
+  
+  pos_Y += distance * sin(theta);
+  pos_X += distance * cos(theta);
+  
+  Serial.print("Y = ");
+    Serial.print(pos_Y);
+    Serial.print(", X = ");
+    Serial.print(pos_X);
+     Serial.print(", theta = ");
+     Serial.print(theta);
+    Serial.println();
+
+}
